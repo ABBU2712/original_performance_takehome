@@ -38,12 +38,14 @@ from problem import (
 
 
 class KernelBuilder:
-    def __init__(self):
+    # Randomized scheduler seed chosen via sweep (lower cycles due to better packing).
+    def __init__(self, schedule_seed: int = 91):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.schedule_seed = schedule_seed
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -158,7 +160,12 @@ class KernelBuilder:
                 cur_reads = set()
                 cur_writes = set()
 
-        for engine, slot in slots:
+        for item in slots:
+            if isinstance(item, dict):
+                flush()
+                instrs.append(item)
+                continue
+            engine, slot = item
             reads, writes, barrier = slot_rw(engine, slot)
             if barrier:
                 flush()
@@ -298,7 +305,7 @@ class KernelBuilder:
 
         # Cache very top forest nodes for early rounds to avoid gather loads.
         top_node_v = []
-        for node_i in range(7):  # nodes 0..6 cover rounds 0,1,2.
+        for node_i in range(7):  # nodes 0..6 cover rounds 0..2.
             node_s = self.alloc_scratch(f"top_node{node_i}_s")
             node_v = self.alloc_scratch(f"top_node{node_i}_v", VLEN)
             if node_i == 0:
@@ -421,6 +428,136 @@ class KernelBuilder:
                         remaining = True
             return out
 
+        def schedule_pipeline_rounds(start_round: int, total_rounds: int, mode: str = "round_robin"):
+            """
+            Cross-round pipeline scheduler for rounds >= start_round.
+            Produces explicit VLIW bundles with load+valu packing.
+            """
+            bundles = []
+            rnd = random.Random(self.schedule_seed)
+
+            # Per-stage state
+            stage_round = [start_round for _ in range(8)]
+            stage_state = ["need_addr" if start_round < total_rounds else "done" for _ in range(8)]
+            stage_loads = [0 for _ in range(8)]
+            stage_comp_ops = [[] for _ in range(8)]
+            stage_comp_idx = [0 for _ in range(8)]
+
+            def stage_done(s):
+                return stage_state[s] == "done"
+
+            def any_active():
+                return any(not stage_done(s) for s in range(8))
+
+            while any_active():
+                bundle = {}
+                addr_issued = set()
+                compute_issued = set()
+
+                # Build valu slots (up to 6): prioritize compute, then staggered addr
+                valu_slots = []
+                # First, compute ops
+                for _ in range(SLOT_LIMITS["valu"]):
+                    found = False
+                    stage_order = list(range(8))
+                    if mode == "random":
+                        rnd.shuffle(stage_order)
+                    for s in stage_order:
+                        if s in compute_issued:
+                            continue
+                        if stage_state[s] == "compute":
+                            ops = stage_comp_ops[s]
+                            idx = stage_comp_idx[s]
+                            if idx < len(ops):
+                                valu_slots.append(ops[idx][1])
+                                stage_comp_idx[s] += 1
+                                compute_issued.add(s)
+                                found = True
+                                break
+                    if not found:
+                        break
+                # Then, addr calcs if slots remain
+                addr_budget = 2
+                for _ in range(min(addr_budget, SLOT_LIMITS["valu"] - len(valu_slots))):
+                    found = False
+                    stage_order = list(range(8))
+                    if mode == "random":
+                        rnd.shuffle(stage_order)
+                    for s in stage_order:
+                        if s in addr_issued:
+                            continue
+                        if stage_state[s] == "need_addr":
+                            idx_reg = idx_regs[s]
+                            addr_reg = addr_regs[s]
+                            valu_slots.append(("+", addr_reg, idx_reg, forest_base_v))
+                            addr_issued.add(s)
+                            found = True
+                            break
+                    if not found:
+                        break
+                if valu_slots:
+                    bundle["valu"] = valu_slots
+
+                # Build load slots (up to 2), simple round-robin across stages
+                load_slots = []
+                for _ in range(SLOT_LIMITS["load"]):
+                    found = False
+                    stage_order = list(range(8))
+                    if mode == "random":
+                        rnd.shuffle(stage_order)
+                    for s in stage_order:
+                        if stage_state[s] == "loading" and stage_loads[s] > 0:
+                            # Don't allow loads in same cycle as addr calc
+                            if s in addr_issued:
+                                continue
+                            load_slots.append(("load_offset", node_regs[s], addr_regs[s], VLEN - stage_loads[s]))
+                            stage_loads[s] -= 1
+                            found = True
+                            break
+                    if not found:
+                        break
+                if load_slots:
+                    bundle["load"] = load_slots
+
+                if not bundle:
+                    break
+
+                bundles.append(bundle)
+
+                # State transitions after cycle
+                for s in addr_issued:
+                    stage_state[s] = "loading"
+                    stage_loads[s] = VLEN
+
+                for s in range(8):
+                    if stage_state[s] == "loading" and stage_loads[s] == 0:
+                        # Loads completed this cycle; compute can start next cycle
+                        stage_state[s] = "compute"
+                        # Build compute ops for this stage/round
+                        update_idx = (stage_round[s] != total_rounds - 1)
+                        valu_ops, _flow_ops = compute_ops_split(
+                            idx_regs[s],
+                            val_regs[s],
+                            node_regs[s],
+                            t1_regs[s],
+                            t2_regs[s],
+                            update_idx=update_idx,
+                        )
+                        stage_comp_ops[s] = valu_ops
+                        stage_comp_idx[s] = 0
+
+                for s in compute_issued:
+                    if stage_state[s] == "compute":
+                        if stage_comp_idx[s] >= len(stage_comp_ops[s]):
+                            # Round done for this stage
+                            stage_round[s] += 1
+                            if stage_round[s] >= total_rounds:
+                                stage_state[s] = "done"
+                            else:
+                                stage_state[s] = "need_addr"
+
+            return bundles
+
 
         # -------------------------
         # Main vector blocks: 8-step software pipeline
@@ -439,8 +576,8 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_consts[k])))
                 body.append(("load", ("vload", val_regs[k], tmp_addr)))
 
-            for r in range(rounds):
-                # Gather nodes for all 8 stages first (ensures node regs are ready).
+            # Rounds 0..2: use cached gather + round-robin compute.
+            for r in range(min(3, rounds)):
                 for stage in range(8):
                     body.extend(
                         gather_round_ops(
@@ -452,7 +589,6 @@ class KernelBuilder:
                         )
                     )
 
-                # Interleave valu ops across stages to maximize valu slot utilization.
                 valu_lists = []
                 flow_lists = []
                 for stage in range(8):
@@ -468,6 +604,10 @@ class KernelBuilder:
                     flow_lists.append(flow_ops)
                 body.extend(round_robin_ops(valu_lists))
                 body.extend(round_robin_ops(flow_lists))
+
+            # Rounds >=3: cross-round pipeline schedule.
+            if rounds > 3:
+                body.extend(schedule_pipeline_rounds(3, rounds, mode="random"))
 
             # Store values once for all 8 blocks
             for k in range(8):
@@ -574,6 +714,7 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
+    schedule_seed: int = 91,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -581,7 +722,7 @@ def do_kernel_test(
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
-    kb = KernelBuilder()
+    kb = KernelBuilder(schedule_seed=schedule_seed)
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
