@@ -36,6 +36,9 @@ from problem import (
     reference_kernel2,
 )
 
+KERNEL_CACHE_VERSION = 1
+KERNEL_CACHE: dict[tuple, tuple] = {}
+
 
 class KernelBuilder:
     # Randomized scheduler seed chosen via sweep (lower cycles due to better packing).
@@ -370,6 +373,238 @@ class KernelBuilder:
 
         return instrs
 
+    def build_linear(self, slots: list[tuple[Engine, tuple]]):
+        """
+        Fast list scheduler (linear-time-ish) that packs ops into cycles by
+        respecting simple RAW/WAR/WAW dependencies and slot limits.
+        """
+        cycles: list[dict[str, list[tuple]]] = []
+        usage: list[dict[str, int]] = []
+        ready_time: dict[int, int] = defaultdict(int)
+        last_write: dict[int, int] = defaultdict(lambda: -1)
+        last_read: dict[int, int] = defaultdict(lambda: -1)
+        next_free: dict[str, int] = defaultdict(int)
+
+        def ensure_cycle(cycle: int) -> None:
+            while len(cycles) <= cycle:
+                cycles.append({})
+                usage.append(defaultdict(int))
+
+        def find_cycle(engine: str, earliest: int) -> int:
+            cycle = earliest if earliest > next_free[engine] else next_free[engine]
+            limit = SLOT_LIMITS[engine]
+            while True:
+                ensure_cycle(cycle)
+                if usage[cycle][engine] < limit:
+                    return cycle
+                cycle += 1
+
+        def place_op(cycle: int, engine: str, slot: tuple, reads, writes) -> None:
+            ensure_cycle(cycle)
+            cycles[cycle].setdefault(engine, []).append(slot)
+            usage[cycle][engine] += 1
+            if usage[cycle][engine] >= SLOT_LIMITS[engine]:
+                next_free[engine] = cycle + 1
+            elif next_free[engine] < cycle:
+                next_free[engine] = cycle
+            for addr in reads:
+                if last_read[addr] < cycle:
+                    last_read[addr] = cycle
+            for addr in writes:
+                last_write[addr] = cycle
+                ready_time[addr] = cycle + 1
+
+        for item in slots:
+            if isinstance(item, dict):
+                # Treat explicit bundle as a barrier: place as-is in next cycle
+                cycle = len(cycles)
+                ensure_cycle(cycle)
+                cycles[cycle] = item
+                # Account for dependencies within the bundle
+                for eng, eng_slots in item.items():
+                    for slot in eng_slots:
+                        reads, writes, _barrier = self._slot_rw(eng, slot)
+                        place_op(cycle, eng, slot, reads, writes)
+                continue
+
+            engine, slot = item
+            reads, writes, barrier = self._slot_rw(engine, slot)
+            if barrier:
+                cycle = len(cycles)
+                ensure_cycle(cycle)
+                place_op(cycle, engine, slot, reads, writes)
+                continue
+
+            earliest = 0
+            for addr in reads:
+                earliest = max(earliest, ready_time[addr])
+            for addr in writes:
+                earliest = max(earliest, last_write[addr] + 1, last_read[addr])
+
+            cycle = find_cycle(engine, earliest)
+            place_op(cycle, engine, slot, reads, writes)
+
+        return [c for c in cycles if c]
+
+    def build_linear_fast(self, slots: list[tuple[Engine, tuple]]):
+        """
+        Faster scheduler: enforces RAW/WAR/WAW with array-backed dependency tracking.
+        """
+        max_addr = SCRATCH_SIZE
+        cycles: list[dict[str, list[tuple]]] = []
+        usage: list[dict[str, int]] = []
+        ready_time = [0] * max_addr
+        last_write = [-1] * max_addr
+        last_read = [-1] * max_addr
+        next_free: dict[str, int] = defaultdict(int)
+        max_cycle = -1
+        barrier_floor = 0
+
+        def ensure_cycle(cycle: int) -> None:
+            while len(cycles) <= cycle:
+                cycles.append({})
+                usage.append(defaultdict(int))
+
+        def find_cycle(engine: str, earliest: int) -> int:
+            cycle = earliest if earliest > next_free[engine] else next_free[engine]
+            limit = SLOT_LIMITS[engine]
+            while True:
+                ensure_cycle(cycle)
+                if usage[cycle][engine] < limit:
+                    return cycle
+                cycle += 1
+
+        def place_op(cycle: int, engine: str, slot: tuple, reads, writes) -> None:
+            nonlocal max_cycle
+            ensure_cycle(cycle)
+            cycles[cycle].setdefault(engine, []).append(slot)
+            usage[cycle][engine] += 1
+            if usage[cycle][engine] >= SLOT_LIMITS[engine]:
+                next_free[engine] = cycle + 1
+            elif next_free[engine] < cycle:
+                next_free[engine] = cycle
+            if cycle > max_cycle:
+                max_cycle = cycle
+            for addr in reads:
+                if last_read[addr] < cycle:
+                    last_read[addr] = cycle
+            for addr in writes:
+                last_write[addr] = cycle
+                ready_time[addr] = cycle + 1
+
+        def iter_reads_writes(engine: str, slot: tuple):
+            reads = []
+            writes = []
+            if engine == "alu":
+                _op, dest, a1, a2 = slot
+                reads = [a1, a2]
+                writes = [dest]
+            elif engine == "valu":
+                match slot:
+                    case ("vbroadcast", dest, src):
+                        reads = [src]
+                        writes = list(range(dest, dest + VLEN))
+                    case ("multiply_add", dest, a, b, c):
+                        reads = (
+                            list(range(a, a + VLEN))
+                            + list(range(b, b + VLEN))
+                            + list(range(c, c + VLEN))
+                        )
+                        writes = list(range(dest, dest + VLEN))
+                    case (_op, dest, a1, a2):
+                        reads = list(range(a1, a1 + VLEN)) + list(range(a2, a2 + VLEN))
+                        writes = list(range(dest, dest + VLEN))
+            elif engine == "load":
+                match slot:
+                    case ("load", dest, addr):
+                        reads = [addr]
+                        writes = [dest]
+                    case ("load_offset", dest, addr, offset):
+                        reads = [addr + offset]
+                        writes = [dest + offset]
+                    case ("vload", dest, addr):
+                        reads = [addr]
+                        writes = list(range(dest, dest + VLEN))
+                    case ("const", dest, _val):
+                        writes = [dest]
+            elif engine == "store":
+                match slot:
+                    case ("store", addr, src):
+                        reads = [addr, src]
+                    case ("vstore", addr, src):
+                        reads = [addr] + list(range(src, src + VLEN))
+            elif engine == "flow":
+                match slot:
+                    case ("select", dest, cond, a, b):
+                        reads = [cond, a, b]
+                        writes = [dest]
+                    case ("vselect", dest, cond, a, b):
+                        reads = (
+                            list(range(cond, cond + VLEN))
+                            + list(range(a, a + VLEN))
+                            + list(range(b, b + VLEN))
+                        )
+                        writes = list(range(dest, dest + VLEN))
+                    case ("add_imm", dest, a, _imm):
+                        reads = [a]
+                        writes = [dest]
+            return reads, writes
+
+        for item in slots:
+            if isinstance(item, dict):
+                cycle = max_cycle + 1
+                ensure_cycle(cycle)
+                for eng, eng_slots in item.items():
+                    for slot in eng_slots:
+                        reads, writes = iter_reads_writes(eng, slot)
+                        place_op(cycle, eng, slot, reads, writes)
+                barrier_floor = cycle + 1
+                continue
+
+            engine, slot = item
+            reads, writes, barrier = self._slot_rw(engine, slot)
+            if barrier:
+                cycle = max_cycle + 1
+                place_op(cycle, engine, slot, reads, writes)
+                barrier_floor = cycle + 1
+                continue
+
+            earliest = 0
+            for addr in reads:
+                rt = ready_time[addr]
+                if rt > earliest:
+                    earliest = rt
+            for addr in writes:
+                lw = last_write[addr] + 1
+                if lw > earliest:
+                    earliest = lw
+                lr = last_read[addr]
+                if lr > earliest:
+                    earliest = lr
+
+            if barrier_floor > earliest:
+                earliest = barrier_floor
+
+            cycle = find_cycle(engine, earliest)
+            place_op(cycle, engine, slot, reads, writes)
+
+        # Local window re-pack to improve packing without global cost.
+        window = 400
+        packed = []
+        i = 0
+        while i < len(cycles):
+            chunk = cycles[i : i + window]
+            flat = []
+            for b in chunk:
+                for eng, eng_slots in b.items():
+                    for slot in eng_slots:
+                        flat.append((eng, slot))
+            # Use greedy within the window.
+            packed.extend(self.build_greedy(flat))
+            i += window
+
+        return [c for c in packed if c]
+
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
@@ -382,10 +617,13 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
+    def scratch_const(self, val, name=None, slots=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            if slots is None:
+                self.add("load", ("const", addr, val))
+            else:
+                slots.append(("load", ("const", addr, val)))
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -409,6 +647,18 @@ class KernelBuilder:
         - parity update via (val & 1)
         - wrap via flow vselect
         """
+        cache_key = (
+            KERNEL_CACHE_VERSION,
+            forest_height,
+            n_nodes,
+            batch_size,
+            rounds,
+            self.schedule_seed,
+        )
+        cached = KERNEL_CACHE.get(cache_key)
+        if cached is not None:
+            self.instrs, self.scratch_debug = cached
+            return
 
         # -------------------------
         # Init scratch + params
@@ -416,6 +666,9 @@ class KernelBuilder:
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
+
+        init_loads = []
+        init_bcasts = []
 
         init_vars = [
             "rounds",
@@ -430,32 +683,38 @@ class KernelBuilder:
             self.alloc_scratch(v, 1)
 
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            init_loads.append(("load", ("const", tmp1, i)))
+            init_loads.append(("load", ("load", self.scratch[v], tmp1)))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        zero_const = self.scratch_const(0, slots=init_loads)
+        one_const = self.scratch_const(1, slots=init_loads)
+        two_const = self.scratch_const(2, slots=init_loads)
 
-        def vec_const(val: int, name: str):
+        def vec_const(val: int, name: str, load_slots=None, bcast_slots=None):
             vec_addr = self.alloc_scratch(name, VLEN)
-            scalar = self.scratch_const(val)
-            self.add("valu", ("vbroadcast", vec_addr, scalar))
+            scalar = self.scratch_const(val, slots=load_slots)
+            if bcast_slots is None:
+                self.add("valu", ("vbroadcast", vec_addr, scalar))
+            else:
+                bcast_slots.append(("valu", ("vbroadcast", vec_addr, scalar)))
             return vec_addr
 
-        zero_v = vec_const(0, "zero_v")
-        one_v = vec_const(1, "one_v")
-        two_v = vec_const(2, "two_v")
-        three_v = vec_const(3, "three_v")
-        four_v = vec_const(4, "four_v")
-        five_v = vec_const(5, "five_v")
-        six_v = vec_const(6, "six_v")
+        zero_v = vec_const(0, "zero_v", init_loads, init_bcasts)
+        one_v = vec_const(1, "one_v", init_loads, init_bcasts)
+        two_v = vec_const(2, "two_v", init_loads, init_bcasts)
+        three_v = vec_const(3, "three_v", init_loads, init_bcasts)
+        four_v = vec_const(4, "four_v", init_loads, init_bcasts)
+        five_v = vec_const(5, "five_v", init_loads, init_bcasts)
+        six_v = vec_const(6, "six_v", init_loads, init_bcasts)
+        # (no extra small idx consts needed)
 
         n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
-        self.add("valu", ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]))
+        init_bcasts.append(("valu", ("vbroadcast", n_nodes_v, self.scratch["n_nodes"])))
 
         forest_base_v = self.alloc_scratch("forest_base_v", VLEN)
-        self.add("valu", ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]))
+        init_bcasts.append(
+            ("valu", ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]))
+        )
 
         # Pre-broadcast hash constants + precompute mul constants for fused stages
         hash_const_v = {}
@@ -465,21 +724,26 @@ class KernelBuilder:
         hash_mul_s = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             if val1 not in hash_const_v:
-                hash_const_v[val1] = vec_const(val1, f"c_{val1}")
+                hash_const_v[val1] = vec_const(val1, f"c_{val1}", init_loads, init_bcasts)
             if val3 not in hash_const_v:
-                hash_const_v[val3] = vec_const(val3, f"c_{val3}")
-            hash_const_s1.append(self.scratch_const(val1))
+                hash_const_v[val3] = vec_const(val3, f"c_{val3}", init_loads, init_bcasts)
+            hash_const_s1.append(self.scratch_const(val1, slots=init_loads))
             # If stage is: t1 = val + c1; t2 = val << s; val = t1 + t2
             # then val = val * (1 + 2^s) + c1  (mod 2^32)
             if (op1, op2, op3) == ("+", "+", "<<"):
                 mul = (1 + (1 << val3)) % (2**32)
                 if mul not in hash_mul_v:
-                    hash_mul_v[mul] = vec_const(mul, f"mul_{mul}")
-                hash_mul_s.append(self.scratch_const(mul))
+                    hash_mul_v[mul] = vec_const(
+                        mul, f"mul_{mul}", init_loads, init_bcasts
+                    )
+                hash_mul_s.append(self.scratch_const(mul, slots=init_loads))
                 hash_const_s3.append(None)
             else:
-                hash_const_s3.append(self.scratch_const(val3))
+                hash_const_s3.append(self.scratch_const(val3, slots=init_loads))
                 hash_mul_s.append(None)
+
+        self.instrs.extend(self.build_greedy(init_loads))
+        self.instrs.extend(self.build_greedy(init_bcasts))
 
         # Required pause alignment for debug harness
         self.add("flow", ("pause",))
@@ -768,6 +1032,13 @@ class KernelBuilder:
 
             return bundles
 
+        def unbundle_ops(bundles: list[dict]) -> list[tuple[Engine, tuple]]:
+            out = []
+            for b in bundles:
+                for eng in ("load", "valu", "alu", "flow", "store", "debug"):
+                    for slot in b.get(eng, []):
+                        out.append((eng, slot))
+            return out
 
         # -------------------------
         # Main vector blocks: 8-step software pipeline
@@ -790,6 +1061,7 @@ class KernelBuilder:
 
             # Rounds 0..2: use cached gather + round-robin compute.
             for r in range(min(3, rounds)):
+                use_alu_xor = (r != 1)
                 for stage in range(PIPE_STAGES):
                     body.extend(
                         gather_round_ops(
@@ -805,7 +1077,8 @@ class KernelBuilder:
                 valu_lists = []
                 flow_lists = []
                 for stage in range(PIPE_STAGES):
-                    alu_lists.append(xor_alu_ops(val_regs[stage], node_regs[stage]))
+                    if use_alu_xor:
+                        alu_lists.append(xor_alu_ops(val_regs[stage], node_regs[stage]))
                     valu_ops, flow_ops = compute_ops_split(
                         idx_regs[stage],
                         val_regs[stage],
@@ -813,17 +1086,19 @@ class KernelBuilder:
                         t1_regs[stage],
                         t2_regs[stage],
                         update_idx=(r != rounds - 1),
-                        use_valu_xor=False,
+                        use_valu_xor=not use_alu_xor,
                     )
                     valu_lists.append(valu_ops)
                     flow_lists.append(flow_ops)
-                body.extend(round_robin_ops(alu_lists))
+                if use_alu_xor:
+                    body.extend(round_robin_ops(alu_lists))
                 body.extend(round_robin_ops(valu_lists))
                 body.extend(round_robin_ops(flow_lists))
 
             # Rounds >=3: cross-round pipeline schedule.
             if rounds > 3:
-                body.extend(schedule_pipeline_rounds(3, rounds, PIPE_STAGES, mode="random"))
+                bundles = schedule_pipeline_rounds(3, rounds, PIPE_STAGES, mode="random")
+                body.extend(unbundle_ops(bundles))
 
             # Store values once for all pipeline stages
             for k in range(PIPE_STAGES):
@@ -848,7 +1123,9 @@ class KernelBuilder:
             )
 
             for r in range(rounds):
-                body.extend(xor_alu_ops(val_regs[0], node_regs[0]))
+                use_alu_xor = (r != 1)
+                if use_alu_xor:
+                    body.extend(xor_alu_ops(val_regs[0], node_regs[0]))
                 valu_ops, flow_ops = compute_ops_split(
                     idx_regs[0],
                     val_regs[0],
@@ -856,7 +1133,7 @@ class KernelBuilder:
                     t1_regs[0],
                     t2_regs[0],
                     update_idx=(r != rounds - 1),
-                    use_valu_xor=False,
+                    use_valu_xor=not use_alu_xor,
                 )
                 body.extend(valu_ops)
                 body.extend(flow_ops)
@@ -918,9 +1195,11 @@ class KernelBuilder:
             body.append(("store", ("store", tmp_addr, tmp_val)))
 
         # Build + emit
-        body_instrs = self.build_greedy(body)
+        body_instrs = self.build_linear_fast(body)
         self.instrs.extend(body_instrs)
         self.instrs.append({"flow": [("pause",)]})
+
+        KERNEL_CACHE[cache_key] = (self.instrs, self.scratch_debug)
 
 
 BASELINE = 147734
